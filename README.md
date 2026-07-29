@@ -106,7 +106,12 @@ format so pseudo-events flow straight into the existing evaluator.
 ```
 pip install -e .                     # or: pip wheel . -w .
 run3-mj-mixer slimmed_X.root config/config.json   # -> ./mixed_slimmed_X.root
+run3-mj-mixer slimmed_X.root config/config.json --outdir hemispheres/HT-400to600
 ```
+
+Condor jobs use `--outdir` to sort the hemisphere files into per-slice
+subdirectories on EOS, keeping them apart from the stitched pseudo-events
+(`docs/how_to_run.md`, step 5).
 
 Condor submission and filelist generation: see `docs/how_to_run.md`.
 

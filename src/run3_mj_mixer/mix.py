@@ -32,8 +32,10 @@ Usage:
     python mix.py input.root config.json
     python mix.py input.root config.json --tree events --chunk-size 50000
 
-Output is written to the current directory as mixed_<input basename>, e.g.
-input /path/to/slimmed_X.root -> ./mixed_slimmed_X.root
+Output is named mixed_<input basename> (with --output-tag: mixed_<tag>_<input
+basename>) and written to --outdir, which defaults to the current directory and
+is created if missing: input /path/to/slimmed_X.root -> ./mixed_slimmed_X.root.
+The condor flow uses --outdir to sort hemisphere files into per-slice dirs.
 
 Config JSON format:
     {
@@ -644,6 +646,10 @@ def main() -> None:
         help="Optional tag added to the output file name",
     )
     parser.add_argument(
+        "--outdir", default=".", metavar="DIR",
+        help="Directory the mixed file is written to (created if missing).",
+    )
+    parser.add_argument(
         "--xs-json", default=None, metavar="PATH",
         help="Cross-section JSON (mj_samples_xs.json). Default: auto-locate a "
              "run3-mj-pass-the-aux/ sibling of run3-mj-mixer (or ./ on a worker).",
@@ -674,9 +680,13 @@ def main() -> None:
     cfg = load_config(args.config)
 
     if args.output_tag:
-        output_path = "mixed_" + args.output_tag + "_" + os.path.basename(args.input)
+        output_name = "mixed_" + args.output_tag + "_" + os.path.basename(args.input)
     else:
-        output_path = "mixed_" + os.path.basename(args.input)
+        output_name = "mixed_" + os.path.basename(args.input)
+    # --outdir may be a nested path (the condor flow passes
+    # hemispheres/<HT slice>), so create the whole chain before writing.
+    os.makedirs(args.outdir, exist_ok=True)
+    output_path = os.path.join(args.outdir, output_name)
 
     mix(
         input_path=args.input,

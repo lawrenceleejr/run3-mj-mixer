@@ -9,11 +9,24 @@ By default each job also STITCHES its own mixed outputs into 6-jet pseudo-events
 (run3-mj-stitch over the job's mixed_*.root; --max-distance / --pt-tolerance /
 --seed are passed through) and delivers BOTH the mixed and the stitched file to
 EOS - the mixed files stay the cheap re-stitch checkpoint for parameter scans.
+
 Pass --no-stitch to skip (e.g. for the one-file-per-job run_all.sh layout, whose
 single-file libraries are not meaningful). A stitch failure never discards the
 mixed outputs: they are delivered anyway and the job exits nonzero afterwards.
 NOTE: stitching assumes one condor run = one slice-balanced job group, i.e.
 -n >= the files-per-job printed by make_mixing_jobs.py.
+
+The two kinds of output land in separate subdirectories of --eosoutdir, with the
+hemisphere (mixed) files further split by HT slice - a job group spans every
+slice, so its mixed files do NOT belong together:
+
+    <eosoutdir>/hemispheres/<HT slice>/mixed_<job>_<input basename>.root
+    <eosoutdir>/stitched/stitched_<job>.root
+
+The slice is read off each input file's name using the cross-section JSON's
+dataset keys (the same rule mix.py uses to find a file's cross section), so
+--base <eosoutdir>/hemispheres feeds straight back into make_eos_filelists.py.
+The submitter prints the layout before submitting.
 
 Build the wheel before submitting:
     pip wheel /path/to/run3-mj-mixer -w .
@@ -59,6 +72,50 @@ _DEFAULT_XS_JSON = os.path.normpath(
     os.path.join(os.path.dirname(__file__), "..", "..",
                  "run3-mj-pass-the-aux", "mj_samples_xs.json")
 )
+
+# Output layout inside the job dir; mirrored under --eosoutdir by the xrdcp step,
+# which preserves relative paths. Hemisphere files get a per-slice level below
+# HEMI_SUBDIR because one job group spans all HT slices.
+HEMI_SUBDIR = "hemispheres"
+STITCH_SUBDIR = "stitched"
+
+# Fallback slice label when the xs JSON can't name a file's slice (see slice_of).
+UNKNOWN_SLICE = "unknown_slice"
+
+# Fallback slice pattern: just the HT bin of a sample name, e.g. 'HT-400to600'
+# out of 'slimmed_QCD-4Jets_HT-400to600_TuneCP5_...'. The 'to<hi>' is optional so
+# the open-ended top bin ('HT-2000') is labelled too.
+_HT_SLICE_RE = re.compile(r"HT-\d+(?:to(?:\d+|Inf))?")
+
+
+def load_xs_keys(xs_json):
+    """Dataset names from the cross-section JSON, used as slice labels. Returns
+    an empty list if it can't be read (slice_of then falls back to the regex)."""
+    if not xs_json:
+        return []
+    try:
+        with open(xs_json) as f:
+            return list(json.load(f).keys())
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return []
+
+
+def slice_of(path, xs_keys):
+    """The HT slice a slimmed input file belongs to, for its output subdirectory.
+
+    Slimmed filenames embed the dataset name (the slimmer's --output-tag), so the
+    longest xs-JSON key contained in the basename names the slice - the same rule
+    mix.py's infer_dataset uses for the cross-section lookup, so the directory a
+    file lands in always matches the weight it was mixed with. Falls back to the
+    HT-slice pattern, then to UNKNOWN_SLICE, so a job is never blocked from
+    running by an unrecognized name.
+    """
+    base = os.path.basename(path)
+    matches = [k for k in xs_keys if k in base]
+    if matches:
+        return max(matches, key=len)
+    found = _HT_SLICE_RE.search(base)
+    return found.group(0) if found else UNKNOWN_SLICE
 
 
 def configure_batch(logdir, names, transfer, eosoutdir, cpu, queue, ram, disk):
@@ -149,9 +206,11 @@ set +e
 echo "what directory am I in?"
 pwd
 echo "List all root files = "
-ls *.root 2>/dev/null || echo "  (no .root output produced)"
+# Outputs are nested now (hemispheres/<slice>/, stitched/), so list recursively.
+root_list=$(find . -type f -name '*.root' | sort)
+echo "${{root_list:-  (no .root output produced)}}"
 echo "List all files"
-ls -alh
+ls -alhR
 echo "*******************************************"
 OUTDIR=root://cmseos.fnal.gov/{EOSOUTDIR}
 echo "xrdcp output for condor to "
@@ -159,18 +218,26 @@ echo "xrdcp output for condor to "
 
 EXECUTABLE_TEMPLATE2 = """\
 echo $OUTDIR
+# Collect the outputs at any depth (hemispheres/<slice>/, stitched/, plus any
+# stray top-level file). find, not a **/ glob: globstar is bash>=4 only, and
+# where it is missing ** silently collapses to one level - which would drop
+# every hemisphere file instead of failing.
+root_files=()
+while IFS= read -r FOUND; do
+  root_files+=( "${FOUND#./}" )
+done < <(find . -type f -name '*.root' | sort)
 # Fail loudly (non-zero exit) if the mixer delivered no output, instead of
 # the old confusing "xrdcp ... no such file" when the *.root glob is empty.
-shopt -s nullglob
-root_files=( *.root )
 if [[ ${#root_files[@]} -eq 0 ]]; then
   echo "ERROR: mixer produced no .root output - nothing to deliver to EOS." >&2
   exit 1
 fi
+# FILE is a path relative to the job dir, so the local layout is reproduced
+# under $OUTDIR. xrdcp -p creates the destination directories.
 for FILE in "${root_files[@]}"
 do
-  echo "xrdcp -f ${FILE} ${OUTDIR}/${FILE}"
-  xrdcp -f "${FILE}" "${OUTDIR}/${FILE}" 2>&1
+  echo "xrdcp -f -p ${FILE} ${OUTDIR}/${FILE}"
+  xrdcp -f -p "${FILE}" "${OUTDIR}/${FILE}" 2>&1
   XRDEXIT=$?
   if [[ $XRDEXIT -ne 0 ]]; then
     echo "ERROR: xrdcp of ${FILE} failed (exit ${XRDEXIT}); output NOT delivered." >&2
@@ -239,6 +306,7 @@ class Batch:
         self.config = args.config
         self.wheel = args.wheel
         self.xs_json = args.xs_json
+        self.xs_keys = load_xs_keys(args.xs_json)
         self.default_tree = args.tree
         self.stitch = not args.no_stitch
         self.max_distance = args.max_distance
@@ -253,10 +321,11 @@ class Batch:
         the job exits with the stitch code at the very end)."""
         if not self.stitch:
             return ""
-        out = f"stitched_{name}.root"
+        out = f"{STITCH_SUBDIR}/stitched_{name}.root"
         return "\n".join([
             "# Stitch this job's library into pseudo-events (method step 4).",
-            f"run3-mj-stitch mixed_*.root -o {out}"
+            "# The library is every slice's hemispheres together, hence the */.",
+            f"run3-mj-stitch {HEMI_SUBDIR}/*/mixed_*.root -o {out}"
             f" --max-distance {self.max_distance:g}"
             f" --pt-tolerance {self.pt_tolerance:g}"
             f" --seed {self.rng_seed}",
@@ -271,6 +340,7 @@ class Batch:
     def _write_jobs(self):
         wheel_basename = os.path.basename(self.wheel)
         config_basename = os.path.basename(self.config)
+        n_per_slice = {}  # slice label -> input files routed to it
         for dataset, subjobs in self.jobs:
             single = (len(subjobs) == 1)
             for i, files in enumerate(subjobs):
@@ -278,6 +348,11 @@ class Batch:
                 run_cmds = []
                 for filepath, tree in files:
                     tree_name = tree if tree else self.default_tree
+                    # Each input's own HT slice, not the job group's name: a job
+                    # group deliberately spans every slice.
+                    slice_name = slice_of(filepath, self.xs_keys)
+                    n_per_slice[slice_name] = n_per_slice.get(slice_name, 0) + 1
+                    hemi_dir = f"{HEMI_SUBDIR}/{slice_name}"
                     # Tag with the dataset name only (not the per-job index):
                     # the input basename already makes each output unique, so
                     # the output is mixed_<dataset>_<input basename>.
@@ -285,6 +360,7 @@ class Batch:
                         f"run3-mj-mixer {filepath} {config_basename}"
                         f" --tree {tree_name}"
                         f" --output-tag {dataset}"
+                        f" --outdir {hemi_dir}"
                     )
                 exe = EXECUTABLE_TEMPLATE.format(
                     WHEEL=wheel_basename,
@@ -297,6 +373,27 @@ class Batch:
                 with open(path, "w") as f:
                     f.write(exe)
                 os.chmod(path, 0o755)
+        self._report_layout(n_per_slice)
+
+    def _report_layout(self, n_per_slice):
+        """Show where the two kinds of output will land, so a mislabelled slice
+        is caught before submitting rather than after a run finishes."""
+        print(f"Output layout under {self.eosoutdir}:")
+        for name in sorted(n_per_slice):
+            print(f"  {HEMI_SUBDIR}/{name:<58} {n_per_slice[name]:>5} file(s)")
+        if self.stitch:
+            # One stitched file per condor run, i.e. per subjob.
+            n_stitched = sum(len(subjobs) for _, subjobs in self.jobs)
+            print(f"  {STITCH_SUBDIR}/{'':<58} {n_stitched:>5} "
+                  "stitched file(s)")
+        n_unknown = n_per_slice.get(UNKNOWN_SLICE, 0)
+        if n_unknown:
+            print(f"\n  Warning: {n_unknown} file(s) have no recognizable HT "
+                  f"slice in their name and go to '{HEMI_SUBDIR}/{UNKNOWN_SLICE}'."
+                  + ("" if self.xs_keys else
+                     f" The xs JSON ({self.xs_json}) could not be read, which "
+                     "is the usual cause - pass --xs-json."))
+        print()
 
     def _write_submit(self):
         names = ""

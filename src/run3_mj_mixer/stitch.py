@@ -38,6 +38,7 @@ Usage:
 
 import argparse
 import math
+import os
 import sys
 
 import awkward as ak
@@ -224,7 +225,8 @@ def main():
     )
     parser.add_argument("inputs", nargs="+", help="mixed ROOT file(s)")
     parser.add_argument("-o", "--output", default="stitched.root",
-                        help="output ROOT file")
+                        help="output ROOT file (its directory is created if "
+                        "missing)")
     parser.add_argument("--tree", default="events", help="input tree name")
     parser.add_argument("--max-distance", type=float, default=0.5,
                         help="reject matches farther than this in the "
@@ -238,6 +240,12 @@ def main():
     parser.add_argument("--chunk-size", type=int, default=100_000,
                         help="output write chunk (events)")
     args = parser.parse_args()
+
+    # -o may point into a subdirectory (the condor flow writes stitched/), so
+    # make it before the expensive stitching rather than failing at write time.
+    out_parent = os.path.dirname(args.output)
+    if out_parent:
+        os.makedirs(out_parent, exist_ok=True)
 
     lib = HemisphereLibrary(seed=args.seed)
     n_events = load_library(args.inputs, args.tree, lib)

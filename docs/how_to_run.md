@@ -1,7 +1,9 @@
 # How to run on the LPC Condor cluster
 
 The mixer runs on **slimmed** files (the output of `run3-mj-slimmer`, tree
-`events`) and writes `mixed_*.root` files back to EOS.
+`events`) and writes `mixed_*.root` files back to EOS, sorted into per-HT-slice
+subdirectories, with the stitched pseudo-events in a subdirectory of their own
+(see [step 5](#5-submit-mix--stitch-in-one-condor-run)).
 
 ## 1. Activate your voms proxy
 `voms-proxy-init --rfc --voms cms -valid 192:00`
@@ -54,10 +56,37 @@ python scripts/submit_mixer.py -i mixing_jobs.json -o /store/user/<you>/mixed \
 bare `/store/...` path; the job adds the `root://cmseos.fnal.gov/` redirector
 automatically.
 
+The two kinds of output go to separate subdirectories of `<eos-outdir>`, and the
+hemisphere (mixed) files are split by HT slice — a job group spans every slice,
+so its mixed files do not belong together:
+
+```
+/store/user/<you>/mixed/
+├── hemispheres/
+│   ├── QCD-4Jets_HT-400to600_TuneCP5_13p6TeV_madgraphMLM-pythia8/
+│   │   ├── mixed_job_1_slimmed_...root
+│   │   └── mixed_job_2_slimmed_...root
+│   └── QCD-4Jets_HT-600to800_TuneCP5_13p6TeV_madgraphMLM-pythia8/
+│       └── ...
+└── stitched/
+    ├── stitched_job_1.root
+    └── stitched_job_2.root
+```
+
+Each file's slice is read off its name using the cross-section JSON's dataset
+keys — the same rule the mixer uses to find that file's cross section, so a
+file's directory always matches the weight it was mixed with. The submitter
+prints the resulting layout (and warns about files it could not label, which
+land in `hemispheres/unknown_slice`) before you submit. Because the per-slice
+dirs are exactly the layout `make_eos_filelists.py` expects, `--base
+/store/user/<you>/mixed/hemispheres` turns the mixed output straight back into
+per-slice filelists.
+
 **Stitching runs inside the job by default**: after mixing its files, each job
-runs `run3-mj-stitch` over its own `mixed_*.root` (the job group is a complete
-slice-balanced library by construction) and delivers BOTH the mixed files and
-`stitched_job_<k>.root` to EOS. The stitch parameters pass through:
+runs `run3-mj-stitch` over its own `hemispheres/*/mixed_*.root` (the job group is
+a complete slice-balanced library by construction) and delivers BOTH the mixed
+files and `stitched/stitched_job_<k>.root` to EOS. The stitch parameters pass
+through:
 `--max-distance` (0.5), `--pt-tolerance` (0.10), `--seed` (42). Pass
 `--no-stitch` to skip. A stitch failure never discards the mixed outputs —
 they are delivered anyway and the job exits nonzero so condor flags it.
@@ -79,7 +108,7 @@ meaningful.)
 ## Run one file locally (no condor)
 ```
 run3-mj-mixer /path/to/slimmed_X.root config/config.json
-# -> ./mixed_slimmed_X.root
+# -> ./mixed_slimmed_X.root   (--outdir DIR writes it elsewhere, creating DIR)
 ```
 
 ## 6. Re-stitching from EOS (parameter scans)
@@ -102,10 +131,11 @@ remote paths):
 
 ```
 HOST=root://cmseos.fnal.gov
-MIXED=/store/user/<you>/mixed
+MIXED=/store/user/<you>/mixed/hemispheres
 OUT=/store/user/<you>/stitched
 for k in $(seq 1 <NJOBS>); do
-    FILES=$(xrdfs ${HOST#root://} ls $MIXED | grep "mixed_job_${k}_" \
+    # -R: the hemisphere files sit one level down, in per-slice subdirs.
+    FILES=$(xrdfs ${HOST#root://} ls -R $MIXED | grep "mixed_job_${k}_" \
             | sed "s|^|$HOST/|")
     run3-mj-stitch $FILES -o stitched_job_${k}.root \
         --max-distance 0.5 --pt-tolerance 0.10 --seed 42
