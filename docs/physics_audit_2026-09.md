@@ -3,8 +3,8 @@
 Scope: the fork's `main` (commit 2bd51c2, identical to upstream `main`) and the
 upstream rewrite on `jslawless/run3-mj-mixer` branch `full-runs` (af39163,
 18 commits ahead). The rewrite supersedes `mix.py` / `stitch.py`; findings are
-labelled by the branch they apply to. Each finding is also filed as a GitHub
-issue.
+labelled by the branch they apply to. Paste-ready GitHub issue bodies for the
+upstream tracker are in `docs/issues/` (one file per finding, same numbering).
 
 Numerical checks run for this audit (synthetic inputs, code executed as-is):
 
